@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from enum import Enum
-from typing import List
+from typing import List, Dict, Union
 
 import pandas
 from pandas import DataFrame
@@ -16,13 +16,12 @@ from collections import OrderedDict
 from scrapy.exceptions import UsageError
 import math
 import logging
-from petl.transform import FieldMapView
+from petl.transform.maps import FieldMapView
 
 
 class BaseExport(BaseCommand):
     """[summary]"""
 
-    # TODO validate length of xlsx file and warn if greater than
     XLSX_MAX_ROW_COUNT = 1048576
     # length of table with header
     TABLE_HEADER_LENGTH = 1
@@ -35,42 +34,29 @@ class BaseExport(BaseCommand):
         super().__init__()
         self.max_records_count = 0
 
-        # - возможность выбора формата файла экспорта: CSV или XLSX. По умолчанию - CSV
         self.file_type = self.FileTypes.xlsx
-        #
         self.field_mapping = {}
-        #
         self.allow_json = True
-        #
         # how much fetches to do for each file (self.max_records_count)
         self.fetching_times = 100
         # place, where mapping will be
         self.column_mapping = {}
-        #
         # list of json columns in file
         # will be used for extending rows
         self.json_columns = []
-        #
         # defines if json-extended rows will be empty
         self.is_new_row_empty = True
-        #
-        self.stats_per_file = {}
-        #
+        self.stats_per_file: Dict[Dict[str, int]] = {}
         self.filename = "exported"
-        #
         self.items_per_file = 100000
-        # TODO remove
-        self.items_per_file = 50
-        #
         self.fetched_rows = 0
-        #
-        logging.getLogger("petl.io.db").setLevel("INFO")
-        #
         # petl-specific mapping
         self._mappings = OrderedDict()
+        #
+        logging.getLogger("petl.io.db").setLevel("INFO")
 
     def init(self) -> None:
-        """Fields initialization before self.run()"""
+        """Init mappings, database, etc."""
         self.column_mapping = {
             "id": "id",
             "url": "url",
@@ -132,7 +118,8 @@ class BaseExport(BaseCommand):
             help="Allow json columns in exported file. Can be 'true', 'allow', 'false', 'deny'",
         )
 
-    def parse_opts(self, opts):
+    def _parse_opts(self, opts):
+
         self.filename = opts.filename
 
         if int(opts.max_records_count) >= 0:
@@ -146,8 +133,7 @@ class BaseExport(BaseCommand):
             raise UsageError("Wrong value for items_per_file!")
 
         allow_json = str(opts.allow_json).lower()
-        self.allow_json = allow_json not in ("false", "deny") or allow_json in ("true", "allow")
-        self.logger.info(f"self.allow_json: {self.allow_json}")
+        self.allow_json = not (allow_json in ("false", "deny")) or allow_json in ("true", "allow")
 
         file_type = str(opts.file_type)
         if file_type == "csv":
@@ -162,28 +148,23 @@ class BaseExport(BaseCommand):
         self.logger.info(args)
         self.logger.info(opts)
 
-        self.parse_opts(opts)
-
         self.run_export(args, opts)
 
     def run_export(self, args: list, opts: list) -> None:
-        # Требования к команде:
-        # - возможность выбор варианта экспорта:
-        #     - c  строками в одной ячейке
-        #     - с вертикальным развертыванием  массивов. Как минимум одно поле, которое будет разворачиваться
-        #           - в случае выбора опции вертикального развертывания также доступна опция выбора заполненности таблицы:
-        #               - дублирование - для каждой развернутой из  записи дублируется вся остальная информация
-        #               - облегченная - информация о присутствует только для первой из записей, для остальных должны быть пустые ячейки
-        # - возможность выбор количества записей для экспорта
+        """Runs file exporting with predefined methods and opts from command line.
+
+        Args:
+            args (list): command line arguments
+            opts (list): command line options
+        """
+        self._parse_opts(opts)
 
         previous_id = 0
         output_data = []
         fetched_data = []
 
-        # will contain filename: length
-
         while (
-            (fetched_data := self.fetch_data(previous_id=previous_id))
+            (fetched_data := self._fetch_data(previous_id=previous_id))
             and len(fetched_data) > self.TABLE_HEADER_LENGTH
             and not self.stopped
         ):
@@ -223,10 +204,7 @@ class BaseExport(BaseCommand):
             }
             self.export_data(output_data, filename)
 
-        # TODO self.stats_per_file here
         for filename in self.stats_per_file:
-            # TODO count file rows
-            # if XLSX_MAX_ROW_COUNT
             self.logger.info(
                 "File: '%s', %s fetched, %s rows in file",
                 filename,
@@ -236,17 +214,24 @@ class BaseExport(BaseCommand):
         self.logger.info("Exported %s rows!", self.fetched_rows)
         self.logger.info("Export done")
 
-    def fetch_data(self, **kwargs):
-        query = text(
+    @property
+    def fetch_query(self) -> text:
+        return text(
             """
             select * from members
             where status in :statuses and id > :previous_id
             limit :take
             """
         )
-        return self._fetch_data(query, **kwargs)
 
-    def _fetch_data(self, query, **kwargs) -> List[dict]:
+    def _fetch_data(self, **kwargs) -> FieldMapView:
+        """Fetches data from database. Is aware of fetch limits, calculates take per query.
+        Feel free to use kwargs for your query.
+    
+        Returns:
+            FieldMapView: Table rows, formatted by 'self.after_fetch()'
+        """
+        query = self.fetch_query
         minimal_take = 1
         take = math.ceil(self.items_per_file // self.fetching_times) or minimal_take
         if self.max_records_count != 0:
@@ -254,66 +239,60 @@ class BaseExport(BaseCommand):
                 take = self.max_records_count - self.fetched_rows
                 self.logger.info("Reached records count of %s!", self.max_records_count)
 
-        table = etl.fromdb(
+        fetched_data = etl.fromdb(
             self.engine, query, **kwargs, take=take, statuses=[MysqlStatusMixin.STATUS_SUCCESS],
         )
-        return self.after_fetch(table)
 
-    def after_fetch(self, fetched_data: List[tuple]) -> List[tuple]:
-        """[summary]
-
-        Args:
-            fetched_data (List[tuple]): [description]
-
-        Returns:
-            List[tuple]: [description]
-        """
-
+        # map fields
         for col in self.column_mapping:
             self._mappings[self.column_mapping[col]] = col
 
+        # deserialize json columns
         for col in self.json_columns:
             self._mappings[self.column_mapping[col]] = col, lambda value: json.loads(value)
-        # TODO custom overrides
 
-        return etl.fieldmap(fetched_data, self._mappings)
+        return self.after_fetch(etl.fieldmap(fetched_data, self._mappings))
 
-    def expand_json(self, output_data):
-        expanding_map = {
-            "positions": [
-                "title",
-                "company",
-                # "company": {
-                #    "url": "https://www.linkedin.com/company/banco-bai/",
-                #    "name": "BAI - Banco Angolano de Investimentos, s.a.",
-                #    "size": "1001-5000",
-                #    "ln_id": 976135,
-                #    "industry_id": 40,
-                # },
-                "end_date",
-                "start_date",
-            ],
-            "educations": [],
-        }
+    def after_fetch(self, fetched_data: FieldMapView) -> FieldMapView:
+        """Formats rows after they are fetched from database.
+
+        Args:
+            fetched_data (FieldMapView): data, fetched from database.
+            Caution: JSON columns from 'self.json_columns' are already python objects
+
+        Returns:
+            FieldMapView: [description]
+        """
+        return fetched_data
+
+    def expand_json_vertical(
+        self, input_data: List[Union[list, tuple]]
+    ) -> List[Union[list, tuple]]:
+        """Expands json lists to rows vertically.
+
+        Args:
+            input_data (List[Union[list, tuple]]): list of rows to be expanded.
+
+        Returns:
+            List[Union[list, tuple]]: list of rows with json lists expanded to rows
+        """
+
+        # Требования к команде:
+        # - возможность выбор варианта экспорта:
+        #     - c  строками в одной ячейке
+        #     - с вертикальным развертыванием  массивов. Как минимум одно поле, которое будет разворачиваться
+        #           - в случае выбора опции вертикального развертывания также доступна опция выбора заполненности таблицы:
+        #               - дублирование - для каждой развернутой из  записи дублируется вся остальная информация
+        #               - облегченная - информация о присутствует только для первой из записей, для остальных должны быть пустые ячейки
+        # - возможность выбор количества записей для экспорта
 
         # new_columns = self.column_mapping.copy()
         # header
 
-        new_output = [output_data[0]]
-        #
-        # get some memory for new columns
-        # expanded_lists = {}
-        # for expanded in expanding_map:
-        #    if expanded in new_columns:
-        #        new_columns.pop(expanded)
-        #
-        #    for inner_json in expanding_map[expanded]:
-        #        col_name = f"{expanded}_{inner_json}"
-        #        new_columns[col_name] = col_name
-        #        expanded_lists[col_name] = []
+        new_output = [input_data[0]]
 
         empty_row = ["" for _ in self.column_mapping]
-        for data_row in output_data[self.TABLE_HEADER_LENGTH :]:
+        for data_row in input_data[self.TABLE_HEADER_LENGTH :]:
             new_data_rows = []
 
             data_row = list(data_row)
@@ -355,31 +334,82 @@ class BaseExport(BaseCommand):
         # self.column_mapping = new_columns
         return new_output
 
-    def before_export(self, output_data: List[list]) -> FieldMapView:
+    def expand_json_horizontal(
+        self, input_data: List[Union[list, tuple]]
+    ) -> List[Union[list, tuple]]:
+        """Expands json dicts to columns horizontally.
 
-        # TODO custom overrides
-        # list some json columns (database names)
+        Args:
+            input_data (List[Union[list, tuple]]): list of rows to be expanded.
+
+        Returns:
+            List[Union[list, tuple]]: list of rows with json dicts expanded to columns
+        """
+        # TODO ?
+
+        #
+        # get some memory for new columns
+        # expanded_lists = {}
+        # for expanded in expanding_map:
+        #    if expanded in new_columns:
+        #        new_columns.pop(expanded)
+        #
+        #    for inner_json in expanding_map[expanded]:
+        #        col_name = f"{expanded}_{inner_json}"
+        #        new_columns[col_name] = col_name
+        #        expanded_lists[col_name] = []
+        return input_data
+
+    def _before_export(self, input_data: List[Union[list, tuple]]) -> FieldMapView:
+        """
+
+        Args:
+            input_data (List[Union[list, tuple]]): [description]
+
+        Returns:
+            FieldMapView: [description]
+        """
+        output_mapping = OrderedDict()
         for col in self.column_mapping:
-            self._mappings[self.column_mapping[col]] = col
+            output_mapping[self.column_mapping[col]] = col
 
-        skip = ["id", "error", "status", "created_at", "updated_at", "sent_to_customer"]
-        for s in skip:
-            if self._mappings.get(s):
-                self._mappings.pop(s)
+        skip_these_columns = [
+            "id",
+            "error",
+            "status",
+            "created_at",
+            "updated_at",
+            "sent_to_customer",
+        ]
+        for skipped_column in skip_these_columns:
+            if output_mapping.get(skipped_column):
+                output_mapping.pop(skipped_column)
 
-        if self.allow_json:
-            for col in self.json_columns:
-                self._mappings[self.column_mapping[col]] = col, lambda value: json.dumps(value)
-        else:
-            output_data = self.expand_json(output_data)
+        if not self.allow_json:
+            input_data = self.expand_json_vertical(input_data)
+            input_data = self.expand_json_horizontal(input_data)
+        for col in self.json_columns:
+            output_mapping[self.column_mapping[col]] = (
+                col,
+                lambda value: json.dumps(value) if value else "",
+            )
 
-        return etl.fieldmap(output_data, self._mappings)
+        return self.before_export(etl.fieldmap(input_data, output_mapping))
+
+    def before_export(self, input_data: FieldMapView) -> FieldMapView:
+        """[summary]
+
+        Args:
+            input_data (FieldMapView): list of rows to be edited before exporting.
+
+        Returns:
+            FieldMapView: [description]
+        """
 
     def export_data(self, output_data, filename: str):
-        output_data = self.before_export(output_data)
+        output_data = self._before_export(output_data)
         # update stats with exported rows count
         self.stats_per_file[filename]["modified_rows"] = len(output_data)
-
         # - Продумать и реализовать удобный маппинг полей из БД в поля файла экспорта.
         # - Подготовить предложения или аргументацию почему так лучше не делать для случая развертываний нескольких полей
         # - После завершения выводить статистику о созданных файлах/количестве записей.
@@ -396,5 +426,11 @@ class BaseExport(BaseCommand):
             output_data.tocsv(f"{filename}.csv", "utf-8", write_header=True)
         elif self.file_type == self.FileTypes.xlsx:
             output_data.toxlsx(f"{filename}.xlsx", write_header=True)
+            if len(output_data) >= self.XLSX_MAX_ROW_COUNT:
+                self.logger.critical(
+                    "Too long file for 'xlsx' type: %s row(s)! Consider reducing file length for '%s'!",
+                    len(output_data),
+                    filename,
+                )
         else:
             raise RuntimeError("Unknown file_type!")
