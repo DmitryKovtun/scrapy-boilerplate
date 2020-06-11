@@ -31,6 +31,8 @@ class BaseExport(BaseCommand):
         # Т.е. для команды можно задать параметрами экспортировать 10000 записей при разделении по 1000 записей в одном файле.
         # Таким образом команда должна сгенерировать 10 файлов
         self.max_file_length = 100000
+        # TODO remove
+        self.max_file_length = 10
 
         # - возможность выбора формата файла экспорта: CSV или XLSX. По умолчанию - CSV
         self.file_type = self.FileTypes.xlsx
@@ -38,7 +40,7 @@ class BaseExport(BaseCommand):
         self.field_mapping = {}
 
         #
-        self.allow_ = True
+        self.allow_json = True
         #
         # how much fetches to do for each file (self.max_file_length)
         self.fetching_times = 100
@@ -76,24 +78,48 @@ class BaseExport(BaseCommand):
 
         fetched_rows = 0
         previous_id = 0
-        while (fetched_data := self.fetch_data(previous_id=previous_id)) and not self.stopped:
-            fetched_rows += len(fetched_data)
-            self.logger.info(len(fetched_data))
-            # for temp in fetched_data:
-            #    self.logger.info(f"\n{temp}\n")
+        output_data = []
+        fetched_data = []
+        # will contain filename: length
+        stats = {}
+        while (
+            (fetched_data := self.fetch_data(previous_id=previous_id))
+            and len(fetched_data) > 1
+            and not self.stopped
+        ):
+            # -1 because of header
+            fetched_rows += len(fetched_data) - 1
+            if not output_data:
+                output_data.append(fetched_data[0])
 
-            # TODO filename generation
-            filename = "temp"
-            if fetched_rows > 5:
+            for row in fetched_data[1:]:
+                # self.logger.info(row)
+                output_data.append(row)
+
+            if fetched_rows % self.max_file_length == 0:
+                # TODO filename generation
+                filename = f"temp_{fetched_rows}"
                 # 'yield' file with data
-                self.export_data(fetched_data, filename)
+                stats[filename] = len(output_data) - 1
+                self.export_data(output_data, filename)
+                output_data = []
+                # TODO remove this
                 break
 
             # TODO more safety with indexes
-            previous_id = etl.cut(fetched_data, "id")[1][0]
+            try:
+                previous_id = etl.cut(fetched_data, "id")[1][0]
+            except etl.errors.FieldSelectionError:
+                self.logger.error("ID not found in fetched_data")
+            except IndexError:
+                # OK
+                pass
             self.logger.info(f"previous_id: {previous_id}")
 
         # TODO stats here
+        for filename in stats:
+            self.logger.info(f"File: '{filename}', {stats[filename]} items")
+        self.logger.info(f"Exported {fetched_rows} rows!")
         self.logger.info("Export done")
 
     def fetch_data(self, **kwargs):
@@ -107,6 +133,7 @@ class BaseExport(BaseCommand):
         return self._fetch_data(query, **kwargs)
 
     def _fetch_data(self, query, **kwargs) -> List[dict]:
+
         take = self.max_file_length // self.fetching_times
 
         #  TODO remove
@@ -123,8 +150,8 @@ class BaseExport(BaseCommand):
             """
             select * from members
             where status in :statuses
-            limit :take
             order by id
+            limit :take
             """
         )
         # return_list = []
@@ -165,7 +192,7 @@ class BaseExport(BaseCommand):
         self.columns = {
             "id": "id",
             "search_id": "search_id",
-            "company_id": "company_id",
+            # "company_id": "company_id",
             "url": "url",
             "ln_id": "ln_id",
             "first_name": "first_name",
@@ -175,7 +202,7 @@ class BaseExport(BaseCommand):
             "connections_count": "connections_count",
             "summary": "summary",
             "industry_id": "industry_id",
-            "current_positions": "current_positions",
+            # "current_positions": "current_positions",
             "positions": "positions",
             "educations": "educations",
             "skills": "skills",
@@ -191,7 +218,7 @@ class BaseExport(BaseCommand):
 
         # list some json columns (database names)
         json_columns = [
-            "current_positions",
+            # "current_positions",
             "positions",
             "educations",
             "skills",
@@ -215,17 +242,8 @@ class BaseExport(BaseCommand):
 
         # TODO custom overrides
         # list some json columns (database names)
-        json_columns = [
-            "current_positions",
-            "positions",
-            "educations",
-            "skills",
-            "interests",
-        ]
         for col in self.columns:
             self.mappings[self.columns[col]] = col
-        # for col in json_columns:
-        #    self.mappings[self.columns[col]] = col, lambda value: json.dumps(value)
         # TODO custom overrides
 
         skip = ["id", "error", "status", "created_at", "updated_at", "sent_to_customer"]
@@ -254,6 +272,9 @@ class BaseExport(BaseCommand):
         # метод маппинга полей в названия колонок файла,
         # возможно метод обновления записи в БД (поддержка поля sent_to_customer)
         # self.logger.info(previous_id)
+        self.file_type = self.FileTypes.csv
+        # self.logger.info(f"output_data: {output_data}")
+
         if self.file_type == self.FileTypes.csv:
             output_data.tocsv(f"{filename}.csv", "utf-8", write_header=True)
         elif self.file_type == self.FileTypes.xlsx:
@@ -261,4 +282,3 @@ class BaseExport(BaseCommand):
 
         else:
             raise RuntimeError("Unknown file_type!")
-        pass
