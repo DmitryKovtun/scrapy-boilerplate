@@ -1,84 +1,85 @@
 # -*- coding: utf-8 -*-
+import json
+import logging
+import math
+from collections import OrderedDict
 from enum import Enum
-from typing import List, Dict, Union
+from typing import Dict, List, Union
 
 import pandas
+import petl as etl
 from pandas import DataFrame
+from petl.transform.maps import FieldMapView
+from scrapy.exceptions import UsageError
 from sqlalchemy import text
 from sqlalchemy.exc import DataError, IntegrityError, InvalidRequestError
 
 from database.models.mixins.mysql_status import MysqlStatusMixin
 
 from .base_command import BaseCommand
-import petl as etl
-import json
-from collections import OrderedDict
-from scrapy.exceptions import UsageError
-import math
-import logging
-from petl.transform.maps import FieldMapView
 
 
 class BaseExport(BaseCommand):
-    """[summary]"""
+    """Base command for csv & xlsx exporting.
+    Usage:
+        poetry run scrapy base_export --records 50 --length 10
+                --file some_custom_name -json allow --type xlsx
+    """
 
     XLSX_MAX_ROW_COUNT = 1048576
     # length of table with header
     TABLE_HEADER_LENGTH = 1
 
     class FileTypes(Enum):
+        """Possible exported file types"""
+
         csv = 0
         xlsx = 1
 
     def __init__(self):
         super().__init__()
-        self.max_records_count = 0
 
-        self.file_type = self.FileTypes.xlsx
+        # defaults
+        self.fetched_rows = 0
         self.field_mapping = {}
-        self.allow_json = True
+        self.stats_per_file: Dict[Dict[str, int]] = {}
+
+        # overriden by options default values
+        # ! WARNING: DO NOT TWEAK THESE, they will be overriden
         # how much fetches to do for each file (self.max_records_count)
         self.fetching_times = 100
+        self.max_records_count = 0
+        self.items_per_file = 100000
+        self.file_type = self.FileTypes.xlsx
+        self.allow_json = True
+        self.filename = "exported"
+
+        # defines if json-extended rows will be empty
+        self.is_new_row_empty = True
         # place, where mapping will be
         self.column_mapping = {}
+        # petl-specific mapping
+        self._mappings = OrderedDict()
         # list of json columns in file
         # will be used for extending rows
         self.json_columns = []
-        # defines if json-extended rows will be empty
-        self.is_new_row_empty = True
-        self.stats_per_file: Dict[Dict[str, int]] = {}
-        self.filename = "exported"
-        self.items_per_file = 100000
-        self.fetched_rows = 0
-        # petl-specific mapping
-        self._mappings = OrderedDict()
-        #
+
         logging.getLogger("petl.io.db").setLevel("INFO")
+
+        self.__decorate_run()
 
     def init(self) -> None:
         """Init mappings, database, etc."""
-        self.column_mapping = {
-            "id": "id",
-            "url": "url",
-            "ln_id": "ln_id",
-            "first_name": "first_name",
-            "last_name": "last_name",
-            "title": "title",
-            "location": "location",
-            "connections_count": "connections_count",
-            "summary": "summary",
-            "industry_id": "industry_id",
-            "positions": "positions",
-            "educations": "educations",
-            "skills": "skills",
-            "interests": "interests",
-        }
-        # list some json columns (database names)
-        self.json_columns = [
-            "positions",
-            "educations",
-            "skills",
-        ]
+        # Example implementation:
+        # # Must-have mappings:
+        # self.column_mapping = {
+        #    "column_in_db_and_python": "Column In File",
+        # }
+        # # List some json columns (database names)
+        # self.json_columns = [
+        #    "column_in_db_and_python_but_with_JSON_data_type",
+        # ]
+        raise NotImplementedError("init(self) should contain column mappings!")
 
     def add_options(self, parser) -> None:
         super().add_options(parser)
@@ -118,8 +119,17 @@ class BaseExport(BaseCommand):
             help="Allow json columns in exported file. Can be 'true', 'allow', 'false', 'deny'",
         )
 
-    def _parse_opts(self, opts):
+    def _parse_opts(self, opts: list):
+        """Parses `opts` parameter and sets instances` fields.
 
+        Args:
+            opts (list): opts from run(args, opts)
+
+        Raises:
+            UsageError: Wrong value for max_records_count
+            UsageError: Wrong value for items_per_file
+            UsageError: Wrong value for file_type! Only 'csv' and 'xlsx' are accepted
+        """
         self.filename = opts.filename
 
         if int(opts.max_records_count) >= 0:
@@ -133,7 +143,7 @@ class BaseExport(BaseCommand):
             raise UsageError("Wrong value for items_per_file!")
 
         allow_json = str(opts.allow_json).lower()
-        self.allow_json = not (allow_json in ("false", "deny")) or allow_json in ("true", "allow")
+        self.allow_json = allow_json not in ("false", "deny") or allow_json in ("true", "allow")
 
         file_type = str(opts.file_type)
         if file_type == "csv":
@@ -143,14 +153,18 @@ class BaseExport(BaseCommand):
         else:
             raise UsageError("Wrong value for file_type! Only 'csv' and 'xlsx' are accepted!")
 
-    def run(self, args: list, opts: list) -> None:
-        self.set_logger("EXPORT", self.settings.get("LOG_LEVEL"))
-        self.logger.info(args)
-        self.logger.info(opts)
+    def __decorate_run(self):
+        def decorator(function):
+            def wrapper(*args, **kwargs):
+                temp_result = function(*args, **kwargs)
+                self._run_export(*args, **kwargs)
+                return temp_result
 
-        self.run_export(args, opts)
+            return wrapper
 
-    def run_export(self, args: list, opts: list) -> None:
+        self.run = decorator(self.run)
+
+    def _run_export(self, args: list, opts: list) -> None:
         """Runs file exporting with predefined methods and opts from command line.
 
         Args:
@@ -176,15 +190,13 @@ class BaseExport(BaseCommand):
                 output_data.append(row)
 
             if self.fetched_rows % self.items_per_file == 0:
-                # TODO filename generation
                 filename = f"{self.filename}_{self.fetched_rows}"
                 # 'yield' file with data
                 self.stats_per_file[filename] = {
                     "fetched_rows": len(output_data) - self.TABLE_HEADER_LENGTH
                 }
-                self.export_data(output_data, filename)
+                self._export_data(output_data, filename)
                 output_data = []
-
             try:
                 previous_id = etl.cut(fetched_data, "id")[self.TABLE_HEADER_LENGTH][0]
             except etl.errors.FieldSelectionError:
@@ -192,18 +204,16 @@ class BaseExport(BaseCommand):
             except IndexError:
                 # OK
                 pass
-            # self.logger.info("previous_id: %s", previous_id)
 
-        # TODO duplicate code fix
-        # TODO filename generation
         if output_data:
             filename = f"{self.filename}_{self.fetched_rows}"
             # 'yield' file with data
             self.stats_per_file[filename] = {
                 "fetched_rows": len(output_data) - self.TABLE_HEADER_LENGTH
             }
-            self.export_data(output_data, filename)
+            self._export_data(output_data, filename)
 
+        # output stats
         for filename in self.stats_per_file:
             self.logger.info(
                 "File: '%s', %s fetched, %s rows in file",
@@ -212,17 +222,16 @@ class BaseExport(BaseCommand):
                 self.stats_per_file[filename]["modified_rows"],
             )
         self.logger.info("Exported %s rows!", self.fetched_rows)
-        self.logger.info("Export done")
+        self.logger.info("Export ended successfully!")
+
+    # data fetching part
 
     @property
     def fetch_query(self) -> text:
-        return text(
-            """
-            select * from members
-            where status in :statuses and id > :previous_id
-            limit :take
-            """
-        )
+        # Query for fetching data
+        # Example implementation:
+        # return text("""select 'your_query' as some_column""")
+        raise NotImplementedError("fetch_query is not implemented!")
 
     def _fetch_data(self, **kwargs) -> FieldMapView:
         """Fetches data from database. Is aware of fetch limits, calculates take per query.
@@ -238,7 +247,6 @@ class BaseExport(BaseCommand):
             if self.fetched_rows + take > self.max_records_count:
                 take = self.max_records_count - self.fetched_rows
                 self.logger.info("Reached records count of %s!", self.max_records_count)
-
         fetched_data = etl.fromdb(
             self.engine, query, **kwargs, take=take, statuses=[MysqlStatusMixin.STATUS_SUCCESS],
         )
@@ -263,7 +271,11 @@ class BaseExport(BaseCommand):
         Returns:
             FieldMapView: [description]
         """
-        return fetched_data
+        # Example implementation:
+        # return fetched_data
+        raise NotImplementedError("after_fetch is not implemented!")
+
+    # rows & columns expanding part
 
     def expand_json_vertical(
         self, input_data: List[Union[list, tuple]]
@@ -360,14 +372,16 @@ class BaseExport(BaseCommand):
         #        expanded_lists[col_name] = []
         return input_data
 
+    # exporting part
+
     def _before_export(self, input_data: List[Union[list, tuple]]) -> FieldMapView:
-        """
+        """Is executed when exporting almost started.
 
         Args:
-            input_data (List[Union[list, tuple]]): [description]
+            input_data (List[Union[list, tuple]]): data to be finalized
 
         Returns:
-            FieldMapView: [description]
+            FieldMapView: list of rows with expanded jsons a
         """
         output_mapping = OrderedDict()
         for col in self.column_mapping:
@@ -394,30 +408,44 @@ class BaseExport(BaseCommand):
                 lambda value: json.dumps(value) if value else "",
             )
 
-        return self.before_export(etl.fieldmap(input_data, output_mapping))
+        return etl.fieldmap(input_data, output_mapping)
 
     def before_export(self, input_data: FieldMapView) -> FieldMapView:
-        """[summary]
+        """User-overridable method to do anything specific with data before exporting to files.
 
         Args:
             input_data (FieldMapView): list of rows to be edited before exporting.
 
         Returns:
-            FieldMapView: [description]
+            FieldMapView: list of processed rows
         """
+        # Example implementation:
+        # return input_data
+        raise NotImplementedError("before_export is not implemented!")
 
-    def export_data(self, output_data, filename: str):
+    def _export_data(self, output_data: FieldMapView, filename: str) -> None:
+        """Exports `output_data` to files.
+
+        Args:
+            output_data (FieldMapView): list of rows to be exported
+            filename (str): name of exported file
+
+        Raises:
+            RuntimeError: Unknown file_type
+        """
         output_data = self._before_export(output_data)
+        output_data = self.before_export(output_data)
         # update stats with exported rows count
         self.stats_per_file[filename]["modified_rows"] = len(output_data)
-        # - Продумать и реализовать удобный маппинг полей из БД в поля файла экспорта.
-        # - Подготовить предложения или аргументацию почему так лучше не делать для случая развертываний нескольких полей
-        # - После завершения выводить статистику о созданных файлах/количестве записей.
+        # - Подготовить предложения или аргументацию почему так лучше не делать для случая
+        # развертываний нескольких полей
         # - Сделать пример использования на основании scrapy команды.
-        # - Результат отправить в отдельную ветку на github scrapy-boilerplate. Сделать PR в ветку разработки
+        # - Результат отправить в отдельную ветку на github scrapy-boilerplate. Сделать PR
+        # в ветку разработки
 
         # - В общем и целом команда для шаблона должна быть абстрактной.
-        # Что-то похожее на rmq.Producer/rmq.Consumer, чтобы при конечной реализации достаточно было определить
+        # Что-то похожее на rmq.Producer/rmq.Consumer, чтобы при конечной реализации достаточно
+        # было определить
         # запрос для получения данных из БД/или метод предварительной подготовки данных,
         # метод маппинга полей в названия колонок файла,
         # возможно метод обновления записи в БД (поддержка поля sent_to_customer)
